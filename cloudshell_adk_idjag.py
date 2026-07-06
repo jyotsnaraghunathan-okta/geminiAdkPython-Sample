@@ -515,13 +515,14 @@ def _sanitize_session_ids(obj: Any) -> Any:
 # ── Diagnostic tool ───────────────────────────────────────────────────────────
 
 def dump_state(tool_context: ToolContext) -> dict:
-    """Diagnostic: returns tool_context.state keys and decodes the incoming
-    access token's iss/aud/exp to verify the ID-JAG STEP3 precondition.
+    """Diagnostic: confirms whether Agentspace delivered the access token and its
+    claims, so the ID-JAG STEP3 precondition can be verified.
 
-    STEP3 only accepts a token minted by the Custom AS with
-    aud=https://smarttriage.com/aud. Ask the agent 'show me your state keys'
-    after deploying, then confirm iss is the Custom AS and aud is the resource.
-    Remove this tool once the precondition is confirmed.
+    tool_context.state is empty in the tool-call context, so the token claims come
+    from `agentspace_auth`, which the instruction provider records from
+    session.state (where the token is present). Confirm agentspace_auth's iss is
+    the Custom AS and aud=https://smarttriage.com/aud. Remove this tool once the
+    precondition is confirmed.
     """
     state_dict = _as_dict(tool_context.state)
     state_keys = list(state_dict.keys())
@@ -530,24 +531,15 @@ def dump_state(tool_context: ToolContext) -> dict:
         for k, v in state_dict.items()
     }
 
-    access_token, matched_key = _find_token(tool_context.state)
-    token_claims = {}
-    if access_token:
-        dec = _decode_jwt_noverify(access_token)
-        token_claims = {k: dec.get(k) for k in ("iss", "aud", "exp", "cid", "scp")}
-
-    print(f"[idjag][DIAG] state keys: {state_keys}", file=sys.stderr, flush=True)
-    print(f"[idjag][DIAG] access token key={matched_key!r} claims={token_claims}",
-          file=sys.stderr, flush=True)
+    print(f"[idjag][DIAG] tool_context.state keys: {state_keys}", file=sys.stderr, flush=True)
+    print(f"[idjag][DIAG] agentspace_auth: {_auth_diag}", file=sys.stderr, flush=True)
     return {
         "state_keys": state_keys,
         "state_redacted": safe_state,
-        "access_token_key": matched_key,
-        "access_token_claims": token_claims,
-        "resource_token_cached": _token_store.valid(),
-        # Populated by the instruction provider (where session.state holds the token),
-        # so this confirms Agentspace delivery even though tool_context.state is empty here.
+        # tool_context.state is empty here; the token is observed by the instruction
+        # provider and recorded in agentspace_auth (received flag + iss/aud/cid/scp).
         "agentspace_auth": _auth_diag,
+        "resource_token_cached": _token_store.valid(),
         "user_id": getattr(tool_context.session, "user_id", None),
         "session_id": getattr(tool_context.session, "id", None),
     }
