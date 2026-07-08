@@ -37,17 +37,16 @@ load_dotenv()
 
 # ── Google Cloud ───────────────────────────────────────────────────────────────
 
-PROJECT  = os.environ["GCP_PROJECT"]
-LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-BUCKET   = os.environ["GCP_BUCKET"]
+PROJECT  = "jo-dev-portal"
+LOCATION = "us-central1"
+BUCKET   = "gs://jo-dev-portal-adk-staging"
 
 vertexai.init(project=PROJECT, location=LOCATION, staging_bucket=BUCKET)
 
-
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-ADAPTER_URL      = os.environ["ADAPTER_URL"]
-MCP_AGENT_HEADER = os.environ.get("MCP_AGENT_HEADER", "gemini-enterprisetools")
+ADAPTER_URL      = "https://okta-mcp-adapter-0tld.onrender.com/"
+MCP_AGENT_HEADER = "gemini-enterprisetools"
 
 # auth_id registered in Agentspace config (without the "temp:" prefix).
 AUTH_ID_PREFIX = "okta-authorization"  # matches any suffix, e.g. okta-authorization-1782243784

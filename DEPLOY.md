@@ -512,7 +512,8 @@ value is wrong for the `resource` param — fix it to what Okta expects.
   so after first consent a fresh chat/turn may be needed for them to show.
 - Remove the `dump_state` diagnostic tool (and the `[idjag]` verbose traces) before
   production.
-- Rotate the RSA private key after prototyping; keep it only in the git-ignored `.env` /
-  the deploy `env_vars`.
+- Store the agent's RSA private key in a secrets manager (e.g. **Google Secret Manager**)
+  and fetch it at runtime, instead of a plaintext `.env` / `env_vars`. Rotate it
+  periodically. (`.env` / `env_vars` is fine for prototyping only.)
 - Prefer binding `aud=https://smarttriage.com/aud` in the **Custom AS** config directly,
   rather than relying on the fragile `resource=` query param on the authorize URL.

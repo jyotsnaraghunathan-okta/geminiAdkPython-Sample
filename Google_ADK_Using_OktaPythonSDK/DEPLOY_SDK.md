@@ -6,7 +6,8 @@ the same AI agent, both starting from the Agentspace access token:
 - **Smart Triage** — Cross-App Access / **ID-JAG**, via the `okta-client-python` SDK
   (`CrossAppAccessFlow`).
 - **GitHub MCP** — Okta **STS / brokered consent**, a single RFC 8693 token exchange
-  done with **manual `httpx`** (see note in §1).
+  via the SDK `TokenExchangeFlow`, with an `APIClientListener` to recover the consent
+  `interaction_uri` the SDK otherwise drops (see note in §1).
 
 > Secrets (private key) live only in a git-ignored `.env`. This doc uses placeholders.
 > The sibling `DEPLOY.md` documents the adapter-free **manual** variant
@@ -31,8 +32,8 @@ the same AI agent, both starting from the Agentspace access token:
 ┌──────────── VERTEX AI AGENT ENGINE — cloudshell_adk_idjag_sdk.py ────────────┐
 │  _instruction_provider → _ensure_tokens(session.state):                       │
 │    • Smart Triage: CrossAppAccessFlow.start()->resume()  (SDK)  → _token_store │
-│    • GitHub:       POST {ORG}/oauth2/v1/token  oauth-sts  (httpx)→ _gh_token_store│
-│         └─ 200 → GitHub token;  interaction_required → interaction_uri (consent)│
+│    • GitHub:       TokenExchangeFlow.start() oauth-sts (SDK)   → _gh_token_store│
+│         └─ token → GitHub token; interaction_required → interaction_uri (listener)│
 │  Toolset A (Smart Triage MCP)   Bearer from _token_store                       │
 │  Toolset B (GitHub MCP)         Bearer from _gh_token_store (tolerant 401)     │
 └───────────────┬──────────────────────────────────────────────▲──────────────┘
@@ -49,13 +50,19 @@ ORG AS      /oauth2/v1             → ID-JAG (Smart Triage) AND oauth-sts (GitH
 RESOURCE AS auszrn0q77tsoa7001d7   → jwt-bearer: ID-JAG → Smart Triage resource token[agent, via SDK]
 ```
 
-**Why GitHub uses manual httpx (not the SDK):** CONFIRMED on 2026-07-07 that the SDK's
-`TokenExchangeFlow` parses an `interaction_required` response into an `OAuth2Error`
-keeping only `error`/`error_description` and **drops Okta's non-standard `interaction_uri`**
-(`additional_fields` came back `{}`). Even Okta's own notebook sample reads
-`interaction_uri` from a side-channel global, not the SDK. Manual `httpx` reads the full
-JSON body, so we can surface the `sts/redirect` consent link. Smart Triage's ID-JAG has
-no such consent step, so it stays on the SDK.
+**How GitHub STS recovers `interaction_uri` from the SDK:** CONFIRMED on 2026-07-07
+(SDK 0.2.0) that `TokenExchangeFlow` → `OAuth2Client.exchange()` collapses an
+`interaction_required` response into an `OAuth2Error` that keeps only
+`error`/`error_description`/`error_uri` and **drops Okta's non-standard `interaction_uri`**
+(the `OAuth2Error` dataclass has no field for it). But the exchange still works via the
+SDK because the transport layer surfaces the body *before* that error is raised: the
+`DefaultNetworkInterface` returns the 4xx body as a `RawResponse` **without raising**, so
+`APIClient.send()` parses the full JSON and fires the registered
+`APIClientListener.did_send()` with it — and only then does `exchange()` raise. So a
+small listener (`_StsInteractionListener`) reads `interaction_uri` off `response.result`
+and stashes it; on the resulting `OAuth2Error` we return that captured URL. No manual
+`httpx` needed — both resources run entirely through the SDK, signed by the shared
+`_org_oauth_client()` key provider. Smart Triage's ID-JAG has no consent step at all.
 
 ---
 
@@ -131,10 +138,11 @@ EOF
 gcloud config set project jo-dev-portal
 gcloud auth application-default login          # if ADC complains
 
-# deps needed to RUN the deploy script (note okta-client-python + pyjwt)
+# deps needed to RUN the deploy script (okta-client-python drives both exchanges;
+# it pulls pyjwt transitively, and mcp pulls httpx)
 pip install --user google-adk==1.33.0 \
   "google-cloud-aiplatform[adk,reasoningengine]" \
-  mcp httpx okta-client-python cryptography pyjwt python-dotenv
+  mcp okta-client-python cryptography python-dotenv
 
 gcloud storage buckets describe gs://jo-dev-portal-adk-staging >/dev/null 2>&1 \
   || gcloud storage buckets create gs://jo-dev-portal-adk-staging --location=us-central1
@@ -168,22 +176,25 @@ authorization id prefix must match `AUTH_ID_PREFIX` (`okta-authorization_native`
 
 ## 6. GitHub STS + brokered consent
 
-On the first GitHub request, the agent runs the STS exchange:
+On the first GitHub request, the agent runs the STS exchange via the SDK
+`TokenExchangeFlow` (client + `private_key_jwt` assertion from `_org_oauth_client()`),
+which POSTs to the Org-AS token endpoint:
 
 ```
-POST {ORG}/oauth2/v1/token
+POST {ORG}/oauth2/v1/token          # built + signed by the SDK
   grant_type=urn:ietf:params:oauth:grant-type:token-exchange
   requested_token_type=urn:okta:params:oauth:token-type:oauth-sts
   subject_token=<Agentspace access token>
   subject_token_type=urn:ietf:params:oauth:token-type:access_token
-  client_assertion=<private_key_jwt (PyJWT)>, client_assertion_type=jwt-bearer
+  client_assertion=<private_key_jwt (SDK key_provider)>, client_assertion_type=jwt-bearer
   resource=orn:oktapreview:idp:github
 ```
 
-- **200** → GitHub token cached (`_gh_token_store`), used as Bearer to `GITHUB_MCP_URL`.
-- **400 `interaction_required`** → the agent captures `interaction_uri` and the instruction
-  provider appends an "🔐 Authorize GitHub →" directive so the model shows the clickable
-  consent link and waits. After the user authorizes, the next turn's STS returns `200`.
+- **success** → GitHub token cached (`_gh_token_store`), used as Bearer to `GITHUB_MCP_URL`.
+- **`interaction_required`** → `TokenExchangeFlow.start()` raises `OAuth2Error`, but
+  `_StsInteractionListener` already captured `interaction_uri` from the raw response body;
+  the instruction provider appends an "🔐 Authorize GitHub →" directive so the model shows
+  the clickable consent link and waits. After the user authorizes, the next turn succeeds.
 
 **Consent UX caveat:** the first GitHub ask shows the consent link but **no GitHub tools
 yet** — `tools/list` ran before consent and the tolerant toolset returned `[]`. After
@@ -203,8 +214,9 @@ gcloud logging read \
 Expected sequence:
 - `STEP1/2 (Agentspace) access_token received` (with `aud=https://smarttriage.com/aud`)
 - `SmartTriage STEP3 … start()` → `STEP3 ok` → `STEP4 … resume()` → `STEP4 ok: resource token cached`
-- `GitHub STS access_token -> oauth-sts (POST …)` → `GitHub STS response` →
-  either `200`+token or `interaction_required` + `interaction_uri`.
+- `GitHub STS access_token -> oauth-sts via TokenExchangeFlow.start() (SDK)` →
+  either `GitHub STS ok: token cached …` or
+  `GitHub STS interaction_required (brokered consent)` + `interaction_uri`.
 
 Or ask the agent `dump_state` → `agentspace_auth` block reports
 `smarttriage_token_cached`, `github_token_cached`, `github_interaction_uri`.
@@ -234,8 +246,8 @@ gcloud ai reasoning-engines delete <ENGINE_ID> --project=jo-dev-portal --region=
 | Symptom | Cause | Fix |
 |---|---|---|
 | Smart Triage `no delegation policy authorizes this token` | subject token's `aud` isn't `https://smarttriage.com/aud`, or XAA policy missing | fix authorize-time `resource`; check the Okta delegation policy |
-| GitHub STS `invalid_target: 'resource' is invalid` | `resource` sent as a bare string (SDK) or wrong ORN | use manual httpx (current) sending `resource=<ORN>`; confirm `GITHUB_RESOURCE_ORN` |
-| GitHub STS `interaction_required`, no consent link | SDK dropped `interaction_uri` | use manual httpx (current) — reads `interaction_uri` from the body |
+| GitHub STS `invalid_target: 'resource' is invalid` | wrong ORN | confirm `GITHUB_RESOURCE_ORN`; the SDK sends it via `resource=[ORN]` (space-joined) |
+| GitHub STS `interaction_required`, no consent link | listener didn't fire / not registered | ensure `_StsInteractionListener` is added to the client before `TokenExchangeFlow.start()`; the listener reads `interaction_uri` in `did_send` before the `OAuth2Error` drops it |
 | `ValueError: Tool 'list_tools' not found` (turn crash) | LLM invented a tool because GitHub tools absent + no consent directive | fixed: consent link now surfaces + instruction forbids inventing tools |
 | GitHub MCP `401` on tools/list | no GitHub token yet (consent pending) | expected pre-consent; tolerant toolset returns `[]`; tools appear post-consent |
 | Deploy `500 INTERNAL` | worker build failure (dep conflict) or transient | retry; check build logs; adjust requirements |
@@ -245,11 +257,23 @@ gcloud ai reasoning-engines delete <ENGINE_ID> --project=jo-dev-portal --region=
 
 ## 10. Notes / production hardening
 
-- `_token_store` and `_gh_token_store` are **shared module-level singletons** — fine for
-  single-user prototype testing; use `ContextVar`s for multi-user isolation. (Also why
-  GitHub tools appear only after a fresh turn post-consent.)
+- Token stores are **per-user**, keyed by the session `user_id`: `_token_stores` /
+  `_gh_token_stores` dicts, with the current request's subject carried in a `ContextVar`
+  (`_current_subject`) set at the entrypoint + instruction/before-tool hooks and read by
+  the connection-params `headers` property. This prevents a warm worker from serving one
+  user's — or a stale — token to another, and ensures a not-yet-consented user triggers
+  the GitHub consent exchange. Verify on deploy that tool calls carry a Bearer (i.e. the
+  ContextVar propagates from the hooks to the MCP header injection in this ADK version);
+  if a user's tool calls go out unauthenticated, that propagation is the thing to check.
+  (GitHub tools still appear only on a fresh turn post-consent — the toolset lists `[]`
+  until the store holds a token.)
 - Remove the `dump_state` diagnostic before production.
-- Rotate the RSA private key after prototyping; keep it only in the git-ignored `.env` /
-  the deploy `env_vars`.
-- GitHub STS uses manual `httpx` deliberately — do not "upgrade" it to the SDK
-  `TokenExchangeFlow` unless a future SDK version surfaces `interaction_uri`.
+- Store the agent's RSA private key in a secrets manager (e.g. **Google Secret Manager**)
+  and fetch it at runtime, instead of a plaintext `.env` / `env_vars`. Rotate it
+  periodically. (`.env` / `env_vars` is fine for prototyping only.)
+- GitHub STS runs on the SDK `TokenExchangeFlow` and depends on
+  `_StsInteractionListener` to recover `interaction_uri` (the `OAuth2Error` still drops
+  it in SDK 0.2.0). If a future SDK surfaces `interaction_uri` on the error directly, the
+  listener can be removed. If the SDK ever changes `DefaultNetworkInterface` to *raise* on
+  4xx instead of returning the body, `did_send` would stop firing — re-verify the consent
+  path after SDK upgrades.
