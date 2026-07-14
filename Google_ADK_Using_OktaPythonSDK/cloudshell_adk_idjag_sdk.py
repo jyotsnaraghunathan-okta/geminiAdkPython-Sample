@@ -1,11 +1,11 @@
 """
-cloudshell_adk_idjag_sdk.py — ADK agent: Smart Triage (ID-JAG) + GitHub (STS), both via SDK.
+cloudshell_adk_idjag_sdk.py — ADK agent: Custom MCP (ID-JAG) + GitHub (STS), both via SDK.
 
 Two Okta resource connections for the same AI agent (wlp10mv0rrvI9zG9M1d8), both
 driven through Okta's okta-client-python SDK and both starting from the same
 Agentspace access token (subject_token_type = access_token):
 
-  1. Smart Triage  — Cross-App Access / ID-JAG, via CrossAppAccessFlow
+  1. Custom MCP  — Cross-App Access / ID-JAG, via CrossAppAccessFlow
                      (start() = access_token->ID-JAG, resume() = ID-JAG->resource token).
   2. GitHub MCP    — Okta STS / brokered consent, a single RFC 8693 token exchange
                      (requested_token_type = urn:okta:params:oauth:token-type:oauth-sts),
@@ -30,7 +30,7 @@ Integration notes (verify on first redeploy)
 * Async bridge: the SDK is async but ADK calls our hooks synchronously inside a
   running loop, so SDK coroutines run in a fresh thread (see _run_async).
 * PEM: LocalKeyProvider signs the private_key_jwt client assertion for the SDK — now
-  for BOTH Smart Triage (ID-JAG) and GitHub (STS), via the shared _org_oauth_client().
+  for BOTH Custom MCP (ID-JAG) and GitHub (STS), via the shared _org_oauth_client().
 * Org-AS issuer/client for the SDK is built by _org_oauth_client() (OKTA_ORG_ISSUER,
   default OKTA_DOMAIN); both the ID-JAG and STS exchanges post to its token endpoint.
 * GitHub tools/list tolerates 401 pre-consent (returns no tools until authorized).
@@ -53,10 +53,12 @@ import threading
 import time
 from typing import Any, Optional
 
+import httpx
 from dotenv import load_dotenv
 import vertexai
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool.mcp_session_manager import CheckableMcpHttpClientFactory
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.tool_context import ToolContext
 from vertexai import agent_engines
@@ -99,12 +101,12 @@ _CFG_KEYS = (
     "AT_AI_AGENT_ID",           # iss/sub of the client assertion (agent identity)
     "AT_AGENT_PRIVATE_KEY_ID",  # kid of the signing key
     "AT_AGENT_PRIVATE_KEY_PEM", # RSA private key (PEM) used to sign the client assertion
-    "SMARTTRIAGE_MCP_URL",      # Custom MCP endpoint
+    "CUSTOM_MCP_URL",      # Custom MCP endpoint
     "GITHUB_MCP_URL",           # GitHub MCP endpoint
     "GITHUB_RESOURCE_ORN",      # Okta resource ORN for the GitHub STS exchange (resource=)
 )
 
-DEFAULT_SMARTTRIAGE_MCP_URL = os.getenv("SMARTTRIAGE_MCP_URL", "https://custom-mcp-server.com/mcp")
+DEFAULT_CUSTOM_MCP_URL = os.getenv("CUSTOM_MCP_URL", "https://custom-mcp-server.com/mcp")
 DEFAULT_GITHUB_MCP_URL      = os.getenv("GITHUB_MCP_URL", "https://api.githubcopilot.com/mcp")
 
 # auth_id prefix registered in Agentspace config; matches any suffix.
@@ -183,7 +185,7 @@ class SanitizingMcpToolset(McpToolset):
 
 class TolerantGitHubMcpToolset(SanitizingMcpToolset):
     """GitHub MCP toolset that tolerates a pre-consent 401 on tools/list: returns
-    no tools until the user authorizes (so Smart Triage still loads). GitHub tools
+    no tools until the user authorizes (so Custom MCP still loads). GitHub tools
     appear on a later session once the user's GitHub store holds a token."""
 
     async def get_tools(self, *args, **kwargs):
@@ -329,7 +331,7 @@ def _key_provider():
 def _org_oauth_client():
     """OAuth2Client for the Okta Org AS, authenticated with the agent's
     private_key_jwt client assertion (SDK-signed via key_provider). Shared by the
-    Smart Triage ID-JAG flow and the GitHub STS token exchange."""
+    Custom MCP ID-JAG flow and the GitHub STS token exchange."""
     okta = _cfg("OKTA_DOMAIN").rstrip("/")
     org_issuer = _cfg("OKTA_ORG_ISSUER", okta)      # verify on redeploy
     org_token_ep = f"{okta}/oauth2/v1/token"
@@ -347,14 +349,14 @@ def _org_oauth_client():
     return OAuth2Client(configuration=config)
 
 
-# ── Smart Triage: ID-JAG via okta-client-python CrossAppAccessFlow ─────────────
+# ── Custom MCP: ID-JAG via okta-client-python CrossAppAccessFlow ─────────────
 
 def _exchange_for_resource_token(user_access_token: str) -> tuple[str, int]:
     """STEP3 (start: access_token -> ID-JAG) + STEP4 (resume: ID-JAG -> resource
     token) via the SDK. Returns (resource_token, exp_epoch); ("", 0) on failure."""
     okta = _cfg("OKTA_DOMAIN").rstrip("/")
     if not okta or not user_access_token:
-        _log_step("SmartTriage: missing OKTA_DOMAIN or access token; skipping", status="skip")
+        _log_step("CustomMCP: missing OKTA_DOMAIN or access token; skipping", status="skip")
         return "", 0
 
     _sc = _decode_jwt_noverify(user_access_token)
@@ -368,28 +370,28 @@ def _exchange_for_resource_token(user_access_token: str) -> tuple[str, int]:
     async def _flow():
         flow = CrossAppAccessFlow(client=_org_oauth_client(),
                                   target=CrossAppAccessTarget(issuer=resource_iss))
-        _log_step("SmartTriage STEP3 access_token -> ID-JAG via CrossAppAccessFlow.start()",
+        _log_step("CustomMCP STEP3 access_token -> ID-JAG via CrossAppAccessFlow.start()",
                   req={"audience": resource_iss, "scope": scopes})
         result = await flow.start(token=user_access_token, token_type="access_token",
                                   audience=resource_iss, scope=scopes)
-        _log_step("SmartTriage STEP3 ok: ID-JAG obtained", status="ok",
+        _log_step("CustomMCP STEP3 ok: ID-JAG obtained", status="ok",
                   resp={"automatic": getattr(result, "resume_assertion_claims", None) is None})
-        _log_step("SmartTriage STEP4 ID-JAG -> resource token via CrossAppAccessFlow.resume()")
+        _log_step("CustomMCP STEP4 ID-JAG -> resource token via CrossAppAccessFlow.resume()")
         return await flow.resume()
 
     try:
         token = _run_async(_flow)
     except Exception as exc:
-        _log_step("SmartTriage ID-JAG exchange failed", status="ERR", resp=repr(exc))
+        _log_step("CustomMCP ID-JAG exchange failed", status="ERR", resp=repr(exc))
         return "", 0
 
     resource_token = getattr(token, "access_token", "") or ""
     if not resource_token:
-        _log_step("SmartTriage exchange returned no access_token", status="ERR", resp=repr(token))
+        _log_step("CustomMCP exchange returned no access_token", status="ERR", resp=repr(token))
         return "", 0
 
     exp = _resolve_exp(resource_token, getattr(token, "expires_in", None))
-    _log_step(f"SmartTriage STEP4 ok: resource token cached (exp={exp}) -> Bearer to MCP")
+    _log_step(f"CustomMCP STEP4 ok: resource token cached (exp={exp}) -> Bearer to MCP")
     return resource_token, exp
 
 
@@ -405,7 +407,7 @@ def _resolve_exp(token: str, expires_in: Any) -> int:
 
 # ── GitHub: Okta STS / brokered consent (SDK TokenExchangeFlow + listener) ─────
 #
-# Uses the SDK's TokenExchangeFlow (same client as Smart Triage's ID-JAG). One
+# Uses the SDK's TokenExchangeFlow (same client as Custom MCP's ID-JAG). One
 # wrinkle: on interaction_required, OAuth2Client.exchange() collapses the response
 # body into an OAuth2Error that keeps only error/error_description/error_uri and
 # DROPS Okta's non-standard `interaction_uri` (CONFIRMED SDK 0.2.0 — OAuth2Error has
@@ -527,7 +529,7 @@ class _TokenStore:
         return (self.__class__, ())
 
 
-_token_stores: dict = {}       # Smart Triage resource tokens, keyed by subject
+_token_stores: dict = {}       # Custom MCP resource tokens, keyed by subject
 _gh_token_stores: dict = {}    # GitHub STS tokens, keyed by subject
 _gh_states: dict = {}          # per subject: {"interaction_uri": <last GitHub consent URL>}
 _auth_diags: dict = {}         # dump_state diagnostics, keyed by subject
@@ -559,7 +561,7 @@ def _new_diag() -> dict:
         "agentspace_token_received": False,
         "matched_key": None,
         "subject_claims": {},
-        "smarttriage_token_cached": False,
+        "custommcp_token_cached": False,
         "github_token_cached": False,
         "github_interaction_required": False,
         "github_interaction_uri": "",
@@ -623,7 +625,7 @@ def _bearer(stores: dict, label: str = "MCP") -> dict:
 
 
 def _ensure_resource_token(state: Any, subject: str) -> None:
-    """Smart Triage ID-JAG exchange (SDK) → subject's store, when empty/expired."""
+    """Custom MCP ID-JAG exchange (SDK) → subject's store, when empty/expired."""
     store = _store_for(_token_stores, subject)
     if store.valid():
         return
@@ -633,7 +635,7 @@ def _ensure_resource_token(state: Any, subject: str) -> None:
     token, exp = _exchange_for_resource_token(access_token)
     if token:
         store.set(token, exp)
-        _diag_for(subject)["smarttriage_token_cached"] = True
+        _diag_for(subject)["custommcp_token_cached"] = True
 
 
 def _ensure_github_token(state: Any, subject: str) -> None:
@@ -688,7 +690,7 @@ def _ensure_tokens(state: Any, subject: str) -> None:
         subject_claims={k: _claims.get(k) for k in ("iss", "aud", "exp", "cid", "scp")},
     )
 
-    for name, fn in (("SmartTriage", _ensure_resource_token), ("GitHub", _ensure_github_token)):
+    for name, fn in (("CustomMCP", _ensure_resource_token), ("GitHub", _ensure_github_token)):
         try:
             fn(state, subject)
         except Exception as exc:
@@ -699,7 +701,7 @@ def _ensure_tokens(state: Any, subject: str) -> None:
 # ── Dynamic connection params (one per resource, own Bearer header) ────────────
 
 class DynamicStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
-    """Smart Triage MCP params — Bearer from the current subject's store."""
+    """Custom MCP connection params — Bearer from the current subject's store."""
 
     def __reduce__(self):
         return (_make_st_params, (self.url, self.timeout))
@@ -710,9 +712,63 @@ def _make_st_params(url: str, timeout: float) -> "DynamicStreamableHTTPConnectio
 
 
 DynamicStreamableHTTPConnectionParams.headers = property(  # type: ignore[assignment]
-    lambda self: _bearer(_token_stores, "SmartTriage"),
+    lambda self: _bearer(_token_stores, "CustomMCP"),
     lambda self, v: None,
 )
+
+
+class _HangingSSEStream(httpx.AsyncByteStream):
+    """Fake persistent SSE stream — sends keepalive comments every 60 s so the
+    MCP TaskGroup's GET task stays alive while tool calls proceed via POST."""
+
+    async def __aiter__(self):
+        try:
+            while True:
+                await asyncio.sleep(60)
+                yield b": keepalive\n\n"
+        except asyncio.CancelledError:
+            return
+
+
+class _GitHub405SilentTransport(httpx.AsyncBaseTransport):
+    """Converts 405 GET (api.githubcopilot.com/mcp has no SSE support) to a
+    fake persistent SSE stream so the MCP TaskGroup doesn't raise and POST-based
+    tool calls can proceed normally."""
+
+    def __init__(self):
+        self._inner = httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        if request.method == "GET" and response.status_code == 405:
+            await response.aclose()
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream", "cache-control": "no-cache"},
+                stream=_HangingSSEStream(),
+                request=request,
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class _GitHubHttpClientFactory:
+    """CheckableMcpHttpClientFactory that silently ignores 405 on SSE GET."""
+
+    def __call__(
+        self,
+        headers: dict[str, str] | None = None,
+        timeout=None,
+        auth=None,
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=_GitHub405SilentTransport(),
+            headers=headers or {},
+            timeout=timeout,
+            auth=auth,
+        )
 
 
 class GitHubStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
@@ -723,7 +779,10 @@ class GitHubStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
 
 
 def _make_github_params(url: str, timeout: float) -> "GitHubStreamableHTTPConnectionParams":
-    return GitHubStreamableHTTPConnectionParams(url=url, timeout=timeout)
+    return GitHubStreamableHTTPConnectionParams(
+        url=url, timeout=timeout, sse_read_timeout=300, terminate_on_close=False,
+        httpx_client_factory=_GitHubHttpClientFactory(),
+    )
 
 
 GitHubStreamableHTTPConnectionParams.headers = property(  # type: ignore[assignment]
@@ -795,7 +854,7 @@ def dump_state(tool_context: ToolContext) -> dict:
         "state_keys": state_keys,
         "state_redacted": safe_state,
         "agentspace_auth": diag,
-        "smarttriage_token_cached": bool(st_store and st_store.valid()),
+        "custommcp_token_cached": bool(st_store and st_store.valid()),
         "github_token_cached": bool(gh_store and gh_store.valid()),
         "github_interaction_uri": gh_state.get("interaction_uri", ""),
         "user_id": getattr(tool_context.session, "user_id", None),
@@ -803,11 +862,29 @@ def dump_state(tool_context: ToolContext) -> dict:
     }
 
 
+def clear_github_token(tool_context: ToolContext) -> dict:
+    """Clear the cached GitHub token for the current user, forcing re-consent on
+    the next GitHub tool call. Useful for demos or after revoking GitHub access."""
+    subject = _subj_var().get() or _subject_key(getattr(tool_context, "session", None))
+    store = _gh_token_stores.get(subject)
+    gh_state = _gh_states.get(subject, {})
+    if store:
+        store.set("", 0)
+    gh_state["interaction_uri"] = ""
+    diag = _diag_for(subject)
+    diag.update(github_token_cached=False, github_interaction_required=False,
+                github_interaction_uri="")
+    print(f"[idjag-sdk] clear_github_token: cleared for subject={subject!r}",
+          file=sys.stderr, flush=True)
+    return {"cleared": True, "subject": subject,
+            "message": "GitHub token cleared. The next GitHub request will require re-authorization."}
+
+
 # ── Instruction provider ───────────────────────────────────────────────────────
 
 _BASE_INSTRUCTION = (
     "You are an enterprise AI assistant. Use your tools to help users with two "
-    "connected systems: Smart Triage (an Okta-protected MCP server for diagnosing "
+    "connected systems: Custom MCP (an Okta-protected MCP server for diagnosing "
     "service health, routing incidents, and tracking cloud spend across a "
     "microservices fleet) and GitHub (via the GitHub MCP server).\n\n"
     "IMPORTANT: If a tool returns an authorization or consent link (a URL), do "
@@ -871,13 +948,14 @@ def _instruction_provider(context: ReadonlyContext) -> str:
 def _build_agent() -> LlmAgent:
     return LlmAgent(
         model="gemini-2.5-flash",
-        name="enterprise_adk_agent",
+        name="Jo_ADKNative",
         instruction=_instruction_provider,
         tools=[
             dump_state,
+            clear_github_token,
             SanitizingMcpToolset(
                 connection_params=DynamicStreamableHTTPConnectionParams(
-                    url=_cfg("SMARTTRIAGE_MCP_URL", DEFAULT_SMARTTRIAGE_MCP_URL),
+                    url=_cfg("CUSTOM_MCP_URL", DEFAULT_CUSTOM_MCP_URL),
                     timeout=120,
                 ),
             ),
@@ -885,6 +963,9 @@ def _build_agent() -> LlmAgent:
                 connection_params=GitHubStreamableHTTPConnectionParams(
                     url=_cfg("GITHUB_MCP_URL", DEFAULT_GITHUB_MCP_URL),
                     timeout=120,
+                    sse_read_timeout=0,
+                    terminate_on_close=False,
+                    httpx_client_factory=_GitHubHttpClientFactory(),
                 ),
             ),
         ],
@@ -896,7 +977,7 @@ def _build_agent() -> LlmAgent:
 
 class EnterpriseAdkApp(AdkApp):
     """AdkApp for Gemini Enterprise. Per-call resource tokens derived from the
-    user access token in session.state (Smart Triage = ID-JAG, GitHub = STS)."""
+    user access token in session.state (Custom MCP = ID-JAG, GitHub = STS)."""
 
     def __init__(self, **kwargs):
         super().__init__(**(kwargs or {"agent": _build_agent(), "enable_tracing": True}))
@@ -956,7 +1037,7 @@ if __name__ == "__main__":
             "cryptography",
         ],
         env_vars=_build_env_vars(),
-        display_name="ADKAgent_OktaPythonSDK",
+        display_name="Jo_ADKNative",
     )
 
     print("Done! Resource name:", remote_app.resource_name)
